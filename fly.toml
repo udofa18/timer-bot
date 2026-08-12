@@ -1,0 +1,17 @@
+# fly.toml — Telegram timer bot (polling worker, no exposed HTTP service)
+
+app = "your-timer-bot"   # change to a unique name, or let `fly launch` fill this in
+primary_region = "lhr"   # pick the region closest to you, e.g. "lhr" (London), "iad" (US East)
+
+[build]
+
+[processes]
+  app = "python telegram_timer_bot.py"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
+
+# No [[services]] block — this app doesn't listen on a port, so Fly
+# won't route external traffic to it. That's expected for a polling bot.

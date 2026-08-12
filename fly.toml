@@ -1,17 +1,25 @@
-# fly.toml — Telegram timer bot (polling worker, no exposed HTTP service)
+# fly.toml app configuration file generated for timer-bot-p87oqa on 2026-08-12T23:09:01Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "your-timer-bot"   # change to a unique name, or let `fly launch` fill this in
-primary_region = "lhr"   # pick the region closest to you, e.g. "lhr" (London), "iad" (US East)
+app = 'timer-bot-p87oqa'
+primary_region = 'ams'
 
 [build]
 
 [processes]
-  app = "python telegram_timer_bot.py"
+  app = 'python telegram_timer_bot.py'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
-
-# No [[services]] block — this app doesn't listen on a port, so Fly
-# won't route external traffic to it. That's expected for a polling bot.

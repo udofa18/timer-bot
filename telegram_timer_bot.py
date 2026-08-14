@@ -6,9 +6,10 @@ Features
 --------
 - /timer  -> shows a display (00:00:00) with buttons: -1 min | Clear | +1 min, and Start
 - Start begins a live countdown, editing the same message every second
-- While running: Pause / Stop buttons replace the +/-/Clear/Start row
+- While running: a single toggle button (⏸ Pause <-> ▶️ Resume) plus Stop
 - When the countdown hits 00:00:00, the bot sends a one-off "time's up" alert
-  and then keeps counting UP as overtime (e.g. "+00:00:07 OVERTIME")
+  and then keeps counting UP as overtime (e.g. "+00:00:07 OVERTIME") --
+  pause/resume still works during overtime.
 - Works in private chats and groups. Any user in the chat can operate the
   buttons by default (see OWNER_ONLY_CONTROL below to lock it to the starter).
 
@@ -18,20 +19,10 @@ Setup
 2. pip install -r requirements.txt   (see bottom comment for the one line needed)
 3. export TELEGRAM_BOT_TOKEN="123456:ABC-your-token"
 4. python telegram_timer_bot.py
-
-Group usage
------------
-- Add the bot to the group as a normal member (no admin rights required just
-  to send/edit its own messages).
-- Bot privacy mode (BotFather -> /setprivacy) can stay ON/default, because
-  this bot never needs to read ordinary group messages -- it only reacts to
-  the /timer command and to button taps (callback queries), both of which
-  reach the bot regardless of privacy mode.
 """
 
 import logging
 import os
-from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -55,7 +46,6 @@ TICK_SECONDS = 1          # how often the display refreshes; use 2-3 in busy gro
 STEP_SECONDS = 60         # what +1 min / -1 min adjusts by
 OWNER_ONLY_CONTROL = False  # True -> only the person who ran /timer can press buttons
 
-# ---- Helpers ------------------------------------------------------------
 
 def format_hms(total_seconds: int) -> str:
     sign = "-" if total_seconds < 0 else ""
@@ -65,60 +55,131 @@ def format_hms(total_seconds: int) -> str:
     return f"{sign}{h:02d}:{m:02d}:{s:02d}"
 
 
-def default_state(owner_id: int) -> dict:
-    return {
-        "remaining": 0,       # seconds left on the clock (>=0 while not in overtime)
-        "running": False,
-        "overtime": False,
-        "overtime_seconds": 0,
-        "owner_id": owner_id,
-        "message_id": None,
-    }
+# ---- The class that owns pause/resume ------------------------------------
 
+class TimerController:
+    """
+    Holds one chat's timer state and every state transition.
+    `started` is True from the moment Start is pressed until Stop is pressed.
+    `running` is True only while it should actually be ticking -- pausing
+    just flips `running` to False without resetting anything, and resuming
+    flips it back. This same flag governs both the countdown phase and the
+    overtime phase, so pause/resume works in either.
+    """
 
-def render_text(state: dict) -> str:
-    if state["overtime"]:
-        clock = format_hms(state["overtime_seconds"])
-        return f"⏰ *TIME'S UP*\nOvertime: `+{clock}`"
-    clock = format_hms(state["remaining"])
-    status = "▶️ Running" if state["running"] else "⏸ Set"
-    return f"⏱ *Timer* — {status}\n\n`{clock}`"
+    def __init__(self, owner_id: int):
+        self.owner_id = owner_id
+        self.message_id = None
+        self.remaining = 0          # seconds left, while counting down
+        self.overtime_seconds = 0   # seconds elapsed, once in overtime
+        self.overtime = False
+        self.started = False
+        self.running = False
 
+    # ---- editing the set time (only while idle, i.e. not started) ----
 
-def build_keyboard(state: dict) -> InlineKeyboardMarkup:
-    if state["running"] or state["overtime"]:
-        rows = [
-            [
-                InlineKeyboardButton("⏸ Pause", callback_data="timer:pause"),
-                InlineKeyboardButton("⏹ Stop", callback_data="timer:stop"),
+    def add_minute(self):
+        if not self.started:
+            self.remaining += STEP_SECONDS
+
+    def subtract_minute(self):
+        if not self.started:
+            self.remaining = max(0, self.remaining - STEP_SECONDS)
+
+    def clear(self):
+        if not self.started:
+            self.remaining = 0
+
+    # ---- lifecycle ----
+
+    def start(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.started = True
+        self.running = True
+        self.overtime = False
+        self.overtime_seconds = 0
+        return True
+
+    def toggle_pause_resume(self):
+        """The core ask: one button, flips running <-> paused."""
+        if self.started:
+            self.running = not self.running
+
+    def stop(self):
+        self.started = False
+        self.running = False
+        self.overtime = False
+        self.overtime_seconds = 0
+        self.remaining = 0
+
+    def tick(self) -> bool:
+        """
+        Advance the clock by one second. Returns True exactly on the tick
+        that crosses into overtime, so the caller knows to send the alert.
+        """
+        just_hit_zero = False
+        if not self.overtime:
+            self.remaining -= 1
+            if self.remaining <= 0:
+                self.remaining = 0
+                self.overtime = True
+                self.overtime_seconds = 0
+                just_hit_zero = True
+        else:
+            self.overtime_seconds += 1
+        return just_hit_zero
+
+    # ---- rendering ----
+
+    def render_text(self) -> str:
+        if self.overtime:
+            clock = format_hms(self.overtime_seconds)
+            status = "▶️ Running" if self.running else "⏸ Paused"
+            return f"⏰ *TIME'S UP* — {status}\nOvertime: `+{clock}`"
+        clock = format_hms(self.remaining)
+        if not self.started:
+            status = "⏸ Set"
+        else:
+            status = "▶️ Running" if self.running else "⏸ Paused"
+        return f"⏱ *Timer* — {status}\n\n`{clock}`"
+
+    def build_keyboard(self) -> InlineKeyboardMarkup:
+        if not self.started:
+            rows = [
+                [
+                    InlineKeyboardButton("➖ 1 min", callback_data="timer:minus"),
+                    InlineKeyboardButton("🗑 Clear", callback_data="timer:clear"),
+                    InlineKeyboardButton("➕ 1 min", callback_data="timer:plus"),
+                ],
+                [InlineKeyboardButton("▶️ Start", callback_data="timer:start")],
             ]
-        ]
-    else:
-        rows = [
-            [
-                InlineKeyboardButton("➖ 1 min", callback_data="timer:minus"),
-                InlineKeyboardButton("🗑 Clear", callback_data="timer:clear"),
-                InlineKeyboardButton("➕ 1 min", callback_data="timer:plus"),
-            ],
-            [InlineKeyboardButton("▶️ Start", callback_data="timer:start")],
-        ]
-    return InlineKeyboardMarkup(rows)
+        else:
+            toggle_label = "⏸ Pause" if self.running else "▶️ Resume"
+            rows = [
+                [
+                    InlineKeyboardButton(toggle_label, callback_data="timer:toggle"),
+                    InlineKeyboardButton("⏹ Stop", callback_data="timer:stop"),
+                ]
+            ]
+        return InlineKeyboardMarkup(rows)
 
 
-async def safe_edit(context: ContextTypes.DEFAULT_TYPE, chat_id: int, state: dict):
+# ---- Telegram plumbing ------------------------------------------------
+
+async def safe_edit(context: ContextTypes.DEFAULT_TYPE, chat_id: int, timer: TimerController):
     """Edit the timer message, tolerating flood limits and 'not modified' errors."""
-    if state["message_id"] is None:
+    if timer.message_id is None:
         return
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
-            message_id=state["message_id"],
-            text=render_text(state),
+            message_id=timer.message_id,
+            text=timer.render_text(),
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=build_keyboard(state),
+            reply_markup=timer.build_keyboard(),
         )
     except RetryAfter as e:
-        # Telegram is rate-limiting us; back off and try once more shortly.
         logger.warning("Rate limited, retrying in %s s", e.retry_after)
     except BadRequest as e:
         if "message is not modified" not in str(e).lower():
@@ -130,45 +191,49 @@ def stop_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         job.schedule_removal()
 
 
+def ensure_job(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Make sure exactly one ticking job exists for this chat."""
+    if not context.job_queue.get_jobs_by_name(str(chat_id)):
+        context.job_queue.run_repeating(
+            tick_job, interval=TICK_SECONDS, first=TICK_SECONDS, chat_id=chat_id, name=str(chat_id)
+        )
+
+
 # ---- Commands -------------------------------------------------------------
 
 async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    state = default_state(owner_id=update.effective_user.id)
-    context.chat_data["timer"] = state
+    timer = TimerController(owner_id=update.effective_user.id)
+    context.chat_data["timer"] = timer
 
     msg = await update.effective_message.reply_text(
-        render_text(state),
+        timer.render_text(),
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=build_keyboard(state),
+        reply_markup=timer.build_keyboard(),
     )
-    state["message_id"] = msg.message_id
+    timer.message_id = msg.message_id
 
 
 # ---- Ticking ----------------------------------------------------------
 
-async def tick(context: ContextTypes.DEFAULT_TYPE):
+async def tick_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    state = context.chat_data.get("timer")
-    if not state or not state["running"]:
+    timer = context.chat_data.get("timer")
+
+    # The job keeps running even while paused (cheap no-op) so it's ready
+    # the instant Resume is pressed, without re-registering a new job.
+    if not timer or not timer.started:
         stop_job(context, chat_id)
         return
 
-    if not state["overtime"]:
-        state["remaining"] -= 1
-        if state["remaining"] <= 0:
-            state["remaining"] = 0
-            state["overtime"] = True
-            state["overtime_seconds"] = 0
-            # one-off alert, separate from the live display message
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="⏰ Time's up! Now counting overtime…",
-            )
-    else:
-        state["overtime_seconds"] += 1
+    if not timer.running:
+        return  # paused -- do nothing this tick
 
-    await safe_edit(context, chat_id, state)
+    just_hit_zero = timer.tick()
+    if just_hit_zero:
+        await context.bot.send_message(chat_id=chat_id, text="⏰ Time's up! Now counting overtime…")
+
+    await safe_edit(context, chat_id, timer)
 
 
 # ---- Button handling ----------------------------------------------------
@@ -176,48 +241,37 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = update.effective_chat.id
-    state = context.chat_data.get("timer")
+    timer = context.chat_data.get("timer")
 
-    if not state:
+    if not timer:
         await query.answer("No active timer here — send /timer to start one.", show_alert=True)
         return
 
-    if OWNER_ONLY_CONTROL and update.effective_user.id != state["owner_id"]:
+    if OWNER_ONLY_CONTROL and update.effective_user.id != timer.owner_id:
         await query.answer("Only the person who started this timer can control it.", show_alert=True)
         return
 
     action = query.data.split(":", 1)[1]
 
     if action == "plus":
-        state["remaining"] += STEP_SECONDS
+        timer.add_minute()
     elif action == "minus":
-        state["remaining"] = max(0, state["remaining"] - STEP_SECONDS)
+        timer.subtract_minute()
     elif action == "clear":
-        state["remaining"] = 0
-        state["overtime"] = False
-        state["overtime_seconds"] = 0
+        timer.clear()
     elif action == "start":
-        if state["remaining"] <= 0:
+        if not timer.start():
             await query.answer("Set a time first with +1 min.", show_alert=True)
             return
-        state["running"] = True
-        state["overtime"] = False
-        stop_job(context, chat_id)  # avoid duplicate jobs
-        context.job_queue.run_repeating(
-            tick, interval=TICK_SECONDS, first=TICK_SECONDS, chat_id=chat_id, name=str(chat_id)
-        )
-    elif action == "pause":
-        state["running"] = False
-        stop_job(context, chat_id)
+        ensure_job(context, chat_id)
+    elif action == "toggle":
+        timer.toggle_pause_resume()
     elif action == "stop":
-        state["running"] = False
-        state["overtime"] = False
-        state["overtime_seconds"] = 0
-        state["remaining"] = 0
+        timer.stop()
         stop_job(context, chat_id)
 
     await query.answer()
-    await safe_edit(context, chat_id, state)
+    await safe_edit(context, chat_id, timer)
 
 
 # ---- Entry point --------------------------------------------------------
